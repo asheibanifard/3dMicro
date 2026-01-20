@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Interactive 3DGS MIP Viewer</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #000; overflow: hidden; font-family: Arial, sans-serif; }
+        #canvas { width: 100vw; height: 100vh; display: block; }
+        #controls {
+            position: absolute; top: 20px; left: 20px;
+            background: rgba(0,0,0,0.8); padding: 15px; border-radius: 10px;
+            color: #fff; font-size: 13px;
+        }
+        #controls h2 { color: #0af; margin-bottom: 10px; font-size: 16px; }
+        #controls label { display: block; margin: 8px 0 3px; color: #aaa; }
+        #controls input[type="range"] { width: 150px; }
+        #controls .val { color: #0af; }
+        #info {
+            position: absolute; bottom: 20px; left: 20px;
+            color: #666; font-size: 12px;
+        }
+        #loading {
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            color: #fff; font-size: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div id="loading">Loading volume...</div>
+    <canvas id="canvas"></canvas>
+    <div id="controls" style="display:none;">
+        <h2>3DGS Skeleton MIP</h2>
+        <label>Brightness: <span class="val" id="brightVal">1.5</span></label>
+        <input type="range" id="brightness" min="0.5" max="5" step="0.1" value="1.5">
+        <label>Threshold: <span class="val" id="threshVal">0.00</span></label>
+        <input type="range" id="threshold" min="0" max="0.3" step="0.01" value="0">
+        <label>Rotation Speed: <span class="val" id="speedVal">1.0</span></label>
+        <input type="range" id="speed" min="0" max="3" step="0.1" value="1">
+        <p style="margin-top:10px; color:#666;">Drag to rotate | Scroll to zoom</p>
+    </div>
+    <div id="info">Volume: 100x650x820 | Gaussians: 15000</div>
+
+<script id="vs" type="x-shader/x-vertex">#version 300 es
+in vec2 aPos;
+out vec2 vUV;
+void main() {
+    vUV = aPos * 0.5 + 0.5;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}
+</script>
+
+<script id="fs" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+precision highp sampler3D;
+in vec2 vUV;
+out vec4 fragColor;
+
+uniform sampler3D uVolume;
+uniform mat3 uRotation;
+uniform float uZoom;
+uniform float uBrightness;
+uniform float uThreshold;
+uniform vec3 uAspect;
+uniform vec2 uResolution;
+
+const int MAX_STEPS = 400;
+const float STEP_SIZE = 0.003;
+
+vec2 intersectBox(vec3 ro, vec3 rd, vec3 boxMin, vec3 boxMax) {
+    vec3 tMin = (boxMin - ro) / rd;
+    vec3 tMax = (boxMax - ro) / rd;
+    vec3 t1 = min(tMin, tMax);
+    vec3 t2 = max(tMin, tMax);
+    float tNear = max(max(t1.x, t1.y), t1.z);
+    float tFar = min(min(t2.x, t2.y), t2.z);
+    return vec2(tNear, tFar);
+}
+
+void main() {
+    vec2 uv = (vUV - 0.5) * 2.0;
+    uv.x *= uResolution.x / uResolution.y;
+    
+    vec3 ro = vec3(0.0, 0.0, uZoom);
+    vec3 rd = normalize(vec3(uv * 0.7, -1.0));
+    
+    ro = uRotation * ro;
+    rd = uRotation * rd;
+    
+    vec3 boxMin = -uAspect * 0.5;
+    vec3 boxMax = uAspect * 0.5;
+    
+    vec2 tHit = intersectBox(ro, rd, boxMin, boxMax);
+    
+    if (tHit.x > tHit.y || tHit.y < 0.0) {
+        fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+    
+    tHit.x = max(tHit.x, 0.0);
+    
+    float maxVal = 0.0;
+    
+    for (int i = 0; i < MAX_STEPS; i++) {
+        float t = tHit.x + float(i) * STEP_SIZE;
+        if (t > tHit.y) break;
+        
+        vec3 pos = ro + rd * t;
+        vec3 texCoord = (pos - boxMin) / (boxMax - boxMin);
+        
+        float val = texture(uVolume, texCoord).r;
+        val = max(0.0, val - uThreshold);
+        maxVal = max(maxVal, val);
+    }
+    
+    float intensity = maxVal * uBrightness;
+    fragColor = vec4(vec3(intensity), 1.0);
+}
+</script>
+
+<script>
+(function() {
+    const canvas = document.getElementById('canvas');
+    const gl = canvas.getContext('webgl2');
+    
+    if (!gl) {
+        document.getElementById('loading').textContent = 'WebGL2 not supported';
+        return;
+    }
+    
+    let volumeTexture;
+    let program, vao;
+    let rotX = 0.3, rotY = 0;
+    let zoom = 2.0;
+    let brightness = 1.5, threshold = 0, speed = 1;
+    let dragging = false, lastX, lastY;
+    const dims = {x: 820, y: 650, z: 100};
+    const maxDim = Math.max(dims.x, dims.y, dims.z);
+    const aspect = {x: dims.x/maxDim, y: dims.y/maxDim, z: dims.z/maxDim};
+    
+    function createShader(type, id) {
+        const src = document.getElementById(id).textContent;
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, src);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+            console.error(gl.getShaderInfoLog(shader));
+            return null;
+        }
+        return shader;
+    }
+    
+    function init() {
+        const vs = createShader(gl.VERTEX_SHADER, 'vs');
+        const fs = createShader(gl.FRAGMENT_SHADER, 'fs');
+        program = gl.createProgram();
+        gl.attachShader(program, vs);
+        gl.attachShader(program, fs);
+        gl.linkProgram(program);
+        
+        const pos = new Float32Array([-1,-1, 1,-1, -1,1, 1,1]);
+        vao = gl.createVertexArray();
+        gl.bindVertexArray(vao);
+        const buf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+        gl.bufferData(gl.ARRAY_BUFFER, pos, gl.STATIC_DRAW);
+        const loc = gl.getAttribLocation(program, 'aPos');
+        gl.enableVertexAttribArray(loc);
+        gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    }
+    
+    function loadVolume() {
+        return fetch('volume.raw')
+            .then(r => r.arrayBuffer())
+            .then(buf => {
+                const data = new Uint8Array(buf);
+                volumeTexture = gl.createTexture();
+                gl.bindTexture(gl.TEXTURE_3D, volumeTexture);
+                gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+                gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+                gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+                gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, dims.x, dims.y, dims.z, 0, gl.RED, gl.UNSIGNED_BYTE, data);
+                return true;
+            });
+    }
+    
+    function makeRotation(rx, ry) {
+        const cx = Math.cos(rx), sx = Math.sin(rx);
+        const cy = Math.cos(ry), sy = Math.sin(ry);
+        return new Float32Array([
+            cy, 0, sy,
+            sx*sy, cx, -sx*cy,
+            -cx*sy, sx, cx*cy
+        ]);
+    }
+    
+    function render() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        
+        gl.clearColor(0, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        
+        rotY += 0.003 * speed;
+        
+        gl.useProgram(program);
+        gl.bindVertexArray(vao);
+        
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_3D, volumeTexture);
+        gl.uniform1i(gl.getUniformLocation(program, 'uVolume'), 0);
+        
+        gl.uniformMatrix3fv(gl.getUniformLocation(program, 'uRotation'), false, makeRotation(rotX, rotY));
+        gl.uniform1f(gl.getUniformLocation(program, 'uZoom'), zoom);
+        gl.uniform1f(gl.getUniformLocation(program, 'uBrightness'), brightness);
+        gl.uniform1f(gl.getUniformLocation(program, 'uThreshold'), threshold);
+        gl.uniform3f(gl.getUniformLocation(program, 'uAspect'), aspect.x, aspect.y, aspect.z);
+        gl.uniform2f(gl.getUniformLocation(program, 'uResolution'), canvas.width, canvas.height);
+        
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        requestAnimationFrame(render);
+    }
+    
+    canvas.addEventListener('mousedown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+    canvas.addEventListener('mousemove', e => {
+        if (!dragging) return;
+        rotY += (e.clientX - lastX) * 0.01;
+        rotX += (e.clientY - lastY) * 0.01;
+        rotX = Math.max(-Math.PI/2, Math.min(Math.PI/2, rotX));
+        lastX = e.clientX; lastY = e.clientY;
+    });
+    canvas.addEventListener('mouseup', () => dragging = false);
+    canvas.addEventListener('mouseleave', () => dragging = false);
+    canvas.addEventListener('wheel', e => {
+        e.preventDefault();
+        zoom *= e.deltaY > 0 ? 1.1 : 0.9;
+        zoom = Math.max(0.5, Math.min(5, zoom));
+    });
+    
+    document.getElementById('brightness').addEventListener('input', e => {
+        brightness = parseFloat(e.target.value);
+        document.getElementById('brightVal').textContent = brightness.toFixed(1);
+    });
+    document.getElementById('threshold').addEventListener('input', e => {
+        threshold = parseFloat(e.target.value);
+        document.getElementById('threshVal').textContent = threshold.toFixed(2);
+    });
+    document.getElementById('speed').addEventListener('input', e => {
+        speed = parseFloat(e.target.value);
+        document.getElementById('speedVal').textContent = speed.toFixed(1);
+    });
+    
+    init();
+    loadVolume().then(() => {
+        document.getElementById('loading').style.display = 'none';
+        document.getElementById('controls').style.display = 'block';
+        render();
+    });
+})();
+</script>
+</body>
+</html>
