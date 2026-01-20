@@ -352,17 +352,18 @@ def compute_skeleton_alignment_loss(gaussians, skeleton_info, volume_shape, devi
     return loss
 
 
-def sample_voxels_stratified(target_volume, num_samples, foreground_ratio=0.6, threshold=0.1):
-    """Sample voxels with bias toward foreground (neuron) regions.
+def sample_voxels_stratified(target_volume, num_samples, foreground_ratio=0.3, threshold=0.1):
+    """Sample voxels with explicit foreground/background split.
     
     Args:
         target_volume: (D, H, W) tensor
         num_samples: total samples
-        foreground_ratio: fraction of samples from foreground
+        foreground_ratio: fraction of samples from foreground (default 0.3 = more background)
         threshold: intensity threshold for foreground
         
     Returns:
-        voxel_coords: (num_samples, 3) tensor of (z, y, x) coordinates
+        fg_samples: (n_fg, 3) foreground coordinates
+        bg_samples: (n_bg, 3) background coordinates
     """
     D, H, W = target_volume.shape
     device = target_volume.device
@@ -374,26 +375,30 @@ def sample_voxels_stratified(target_volume, num_samples, foreground_ratio=0.6, t
     n_fg = int(num_samples * foreground_ratio)
     n_bg = num_samples - n_fg
     
-    samples = []
-    
     # Sample foreground
     if len(fg_indices) > 0 and n_fg > 0:
         fg_idx = torch.randint(0, len(fg_indices), (n_fg,), device=device)
         fg_samples = fg_indices[fg_idx].float()
-        samples.append(fg_samples)
     else:
+        fg_samples = torch.empty((0, 3), device=device)
         n_bg += n_fg  # fallback to all background if no foreground
     
-    # Sample background uniformly
-    if n_bg > 0:
+    # Sample background (explicitly from low-intensity regions)
+    bg_mask = target_volume <= threshold
+    bg_indices = bg_mask.nonzero()
+    
+    if len(bg_indices) > 0 and n_bg > 0:
+        bg_idx = torch.randint(0, len(bg_indices), (n_bg,), device=device)
+        bg_samples = bg_indices[bg_idx].float()
+    else:
+        # Fallback: uniform random
         bg_samples = torch.stack([
             torch.randint(0, D, (n_bg,), device=device).float(),
             torch.randint(0, H, (n_bg,), device=device).float(),
             torch.randint(0, W, (n_bg,), device=device).float()
         ], dim=1)
-        samples.append(bg_samples)
     
-    return torch.cat(samples, dim=0)
+    return fg_samples, bg_samples
 
 
 def query_gaussians_fast(means_world, opacity, inv_cov, voxel_coords):
@@ -1060,7 +1065,8 @@ def render_slice_comparison(gaussians, target_volume, volume_shape, slice_positi
 
 
 def densify_and_split_tubes_microscopy(gaussians, volume_shape, voxel_spacing, iteration, 
-                                        skeleton_info=None, densify_warmup_iter=200):
+                                        skeleton_info=None, target_volume=None,
+                                        densify_warmup_iter=200):
     """Microscopy-oriented densification using physical units and importance metric.
     
     Key improvements:
@@ -1069,6 +1075,7 @@ def densify_and_split_tubes_microscopy(gaussians, volume_shape, voxel_spacing, i
     - Anisotropy-aware splitting
     - Clone offset along skeleton tangent for connectivity preservation
     - EMA warmup: no densification until EMA has stabilized
+    - GT intensity gating: only densify Gaussians near actual foreground
     
     Note: GaussianModel stores scales in canonical (x, y, z) order.
     """
@@ -1085,6 +1092,25 @@ def densify_and_split_tubes_microscopy(gaussians, volume_shape, voxel_spacing, i
     
     # Compute importance metric
     importance = (gaussians.grad_ema.squeeze(1) * gaussians.opacity_ema.squeeze(1))
+    
+    # GT intensity gating: only densify Gaussians whose centers are near foreground
+    # This prevents spawning Gaussians in background regions
+    if target_volume is not None:
+        xyz = gaussians.get_xyz  # (N, 3) in canonical (x, y, z) normalized
+        # Convert to voxel coordinates for sampling
+        voxel_coords = torch.stack([
+            (xyz[:, 2] * D).clamp(0, D-1),  # z
+            (xyz[:, 1] * H).clamp(0, H-1),  # y
+            (xyz[:, 0] * W).clamp(0, W-1),  # x
+        ], dim=1)  # (N, 3) in (z, y, x) voxel space
+        
+        # Sample GT intensity at Gaussian centers
+        gt_intensity = trilinear_sample(target_volume, voxel_coords)
+        
+        # Only allow densification where GT intensity > threshold
+        fg_gate = gt_intensity > 0.05  # Gaussians must be near foreground
+    else:
+        fg_gate = torch.ones(gaussians.get_xyz.shape[0], dtype=torch.bool, device=device)
     
     # Get scales in physical units
     # scales are in canonical (x, y, z) order
@@ -1109,8 +1135,8 @@ def densify_and_split_tubes_microscopy(gaussians, volume_shape, voxel_spacing, i
     I_thr = op_thr * g_thr  # ~1e-5
     r_max = 8.0  # max anisotropy ratio (was 10.0, lower = rounder Gaussians)
     
-    # Densification masks
-    important_mask = importance > I_thr
+    # Densification masks - now gated by GT foreground
+    important_mask = (importance > I_thr) & fg_gate
     
     # Clone: small important Gaussians
     small_mask = s_max < s_clone
@@ -1480,12 +1506,26 @@ def train_volumetric_gaussians(
         target_skeleton = trilinear_sample(target_volume, skeleton_samples)
         loss_skeleton = F.mse_loss(rendered_skeleton, target_skeleton)
         
-        # 2. Stratified voxel loss: random samples biased toward foreground
-        random_samples = sample_voxels_stratified(target_volume, num_samples=30000, 
-                                                   foreground_ratio=0.7, threshold=fg_threshold)
-        rendered_random = query_gaussians_chunked(gaussians, random_samples, volume_shape, query_params=query_params)
-        target_random = trilinear_sample(target_volume, random_samples)
-        loss_random = F.mse_loss(rendered_random, target_random)
+        # 2. Stratified voxel loss with explicit foreground/background weighting
+        # Use 30% foreground, 70% background to better learn to suppress background
+        fg_samples, bg_samples = sample_voxels_stratified(target_volume, num_samples=30000, 
+                                                          foreground_ratio=0.3, threshold=fg_threshold)
+        
+        # Foreground loss (reconstruct the neuron)
+        if len(fg_samples) > 0:
+            rendered_fg = query_gaussians_chunked(gaussians, fg_samples, volume_shape, query_params=query_params)
+            target_fg = trilinear_sample(target_volume, fg_samples)
+            loss_fg = F.mse_loss(rendered_fg, target_fg)
+        else:
+            loss_fg = torch.tensor(0.0, device=device)
+        
+        # Background loss (should render to ~0, weighted higher to suppress noise)
+        rendered_bg = query_gaussians_chunked(gaussians, bg_samples, volume_shape, query_params=query_params)
+        target_bg = trilinear_sample(target_volume, bg_samples)
+        # Weight background loss higher since we want Gaussians to NOT activate there
+        loss_bg = F.mse_loss(rendered_bg, target_bg) * 2.0  # 2x weight on background
+        
+        loss_random = loss_fg + loss_bg
         
         # 3. Anisotropy encouragement: penalize isotropic (spherical) Gaussians
         # With proper normalization, anisotropy directly affects shape without affecting mass
@@ -1515,6 +1555,12 @@ def train_volumetric_gaussians(
         # This is more appropriate for tubular structures than random diversity
         loss_alignment = compute_skeleton_alignment_loss(gaussians, skeleton_info, volume_shape, device)
         
+        # 6. Sparsity penalty on opacity - encourage fewer, stronger Gaussians
+        # This helps reduce "fog" from many low-opacity Gaussians
+        opacity = gaussians.get_opacity.squeeze(1)  # (N,)
+        # L1 penalty encourages sparsity (many zeros, few large values)
+        loss_sparsity = opacity.mean() * 0.1  # small weight
+        
         # Total loss with curriculum: skeleton-heavy early, balanced later
         skeleton_weight = max(0.5, 1.0 - iteration / 2000)  # 1.0 -> 0.5
         random_weight = 1.0 - skeleton_weight + 0.5  # 0.5 -> 1.0
@@ -1523,10 +1569,11 @@ def train_volumetric_gaussians(
             skeleton_weight * loss_skeleton +
             random_weight * loss_random +
             0.02 * loss_anisotropy +  # Encourage elongated (tube-like) Gaussians
-            0.05 * loss_scale_min +   # Stronger penalty for too-small scales (was 0.02)
+            0.05 * loss_scale_min +   # Stronger penalty for too-small scales
             0.02 * loss_scale_max +
-            0.05 * loss_scale_small + # Stronger penalty for small avg scales (was 0.01)
-            0.05 * loss_alignment     # Align Gaussian orientations to skeleton tangents
+            0.05 * loss_scale_small + # Stronger penalty for small avg scales
+            0.05 * loss_alignment +   # Align Gaussian orientations to skeleton tangents
+            loss_sparsity             # Sparsity penalty on opacity
         )
         
         # Backward
@@ -1558,7 +1605,8 @@ def train_volumetric_gaussians(
             if iteration % densification_interval == 0:
                 n_clone, n_split = densify_and_split_tubes_microscopy(
                     gaussians, volume_shape, voxel_spacing, iteration,
-                    skeleton_info=skeleton_info
+                    skeleton_info=skeleton_info,
+                    target_volume=target_volume
                 )
                 n_pruned = prune_gaussians_microscopy(
                     gaussians, volume_shape, voxel_spacing,
