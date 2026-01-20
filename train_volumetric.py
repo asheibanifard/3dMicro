@@ -32,7 +32,6 @@ from scene.gaussian_model import GaussianModel
 
 # Import CUDA MIP kernel (differentiable version)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'gaussian_mip_src'))
-from gaussian_mip_pkg import mip_render
 
 
 def load_swc(swc_path):
@@ -662,7 +661,7 @@ def precompute_gaussian_query_params(gaussians, volume_shape):
 _spatial_index_cache = {'n_gaussians': -1, 'index': None, 'iteration': -1}
 
 
-def query_gaussians_chunked(gaussians, voxel_coords, volume_shape, chunk_size=20000, 
+def query_gaussians_chunked(gaussians, voxel_coords, volume_shape, chunk_size=4000, 
                             use_spatial_index=True, query_params=None):
     """Evaluate Gaussians at voxel positions with spatial indexing for efficiency.
     
@@ -711,7 +710,6 @@ def query_gaussians_chunked(gaussians, voxel_coords, volume_shape, chunk_size=20
     
     for i in range(0, M, chunk_size):
         chunk_coords = voxel_coords[i:i+chunk_size]  # (C, 3)
-        C = len(chunk_coords)
         
         # Compute differences: (C, N, 3)
         diff = chunk_coords.unsqueeze(1) - means_world.unsqueeze(0)
@@ -721,13 +719,15 @@ def query_gaussians_chunked(gaussians, voxel_coords, volume_shape, chunk_size=20
         temp = torch.einsum('cni,nij->cnj', diff, precision)
         # (C, N, 3) * (C, N, 3) -> (C, N)
         mahal_sq = (temp * diff).sum(dim=2)
+        del diff, temp  # Free memory immediately
         
         # Normalized Gaussian values
         gaussian_vals = torch.exp(-0.5 * mahal_sq.clamp(max=20))  # (C, N)
+        del mahal_sq  # Free memory
         
         # Weight by opacity and normalization factor, then sum
-        contributions = gaussian_vals * opacity.unsqueeze(0) * norm_factor.unsqueeze(0)  # (C, N)
-        chunk_rendered = contributions.sum(dim=1)  # (C,)
+        chunk_rendered = (gaussian_vals * opacity.unsqueeze(0) * norm_factor.unsqueeze(0)).sum(dim=1)
+        del gaussian_vals  # Free memory
         
         rendered_chunks.append(chunk_rendered)
     
@@ -802,151 +802,6 @@ def trilinear_sample(volume, coords):
     c1 = c10 * (1 - yd) + c11 * yd
     
     return c0 * (1 - zd) + c1 * zd
-
-
-def render_mip_simple(gaussians, volume_shape, image_size=None):
-    """Differentiable MIP rendering along z-axis (xy plane view) with proper rotation."""
-    D, H, W = volume_shape
-    device = gaussians.get_xyz.device
-    
-    if image_size is None:
-        img_h, img_w = H, W
-    else:
-        img_h, img_w = image_size
-    
-    xyz = gaussians.get_xyz  # (N, 3) in canonical (x, y, z) order
-    opacity = gaussians.get_opacity
-    scales = gaussians.get_scaling  # (N, 3) in (x, y, z) order
-    rotations = gaussians.get_rotation  # (N, 4) quaternions
-    
-    # World coordinates - xyz is in canonical (x, y, z) order
-    x_world = (xyz[:, 0] - 0.5) * W
-    y_world = (xyz[:, 1] - 0.5) * H
-    z_world = (xyz[:, 2] - 0.5) * D
-    
-    # 2D projection positions for XY view (looking down z-axis)
-    px = (x_world / W + 0.5) * img_w
-    py = (y_world / H + 0.5) * img_h
-    means2D = torch.stack([px, py], dim=1)
-    
-    # Compute 3D covariance matrices from scales and rotations
-    # scales are in (x, y, z) order
-    scales_world = scales * torch.tensor([W, H, D], device=device)
-    rot_matrices = quaternion_to_rotation_matrix(rotations)  # (N, 3, 3) in (x, y, z)
-    S = torch.diag_embed(scales_world)  # (N, 3, 3)
-    cov3d = rot_matrices @ S @ S @ rot_matrices.transpose(-1, -2)  # (N, 3, 3)
-    
-    # Project 3D covariance to 2D (xy plane, looking down z-axis)
-    # Take 2x2 submatrix for x and y dimensions (indices 0 and 1)
-    cov2d = torch.stack([
-        torch.stack([cov3d[:, 0, 0], cov3d[:, 0, 1]], dim=1),  # [x,x], [x,y]
-        torch.stack([cov3d[:, 1, 0], cov3d[:, 1, 1]], dim=1)   # [y,x], [y,y]
-    ], dim=1)  # (N, 2, 2)
-    
-    # Scale to pixel space
-    pixel_scale = torch.tensor([[img_w/W, 0], [0, img_h/H]], device=device)
-    cov2d_px = pixel_scale @ cov2d @ pixel_scale.T  # (N, 2, 2)
-    
-    # Extract eigenvalues as sigmas (axis-aligned approximation for rendering)
-    # For MIP kernel which expects diagonal covariance
-    eigenvalues = torch.linalg.eigvalsh(cov2d_px)  # (N, 2)
-    sigma_x_px = torch.clamp(torch.sqrt(eigenvalues[:, 0] + 1e-6), min=0.5)
-    sigma_y_px = torch.clamp(torch.sqrt(eigenvalues[:, 1] + 1e-6), min=0.5)
-    sigmas = torch.stack([sigma_x_px, sigma_y_px], dim=1)
-    
-    intensities = opacity.squeeze(-1)
-    image = mip_render(means2D, sigmas, intensities, img_h, img_w)
-    
-    viewspace_points = means2D
-    if viewspace_points.requires_grad:
-        viewspace_points.retain_grad()
-    
-    return image, viewspace_points
-
-
-def render_mip_xz(gaussians, volume_shape):
-    """MIP rendering along y-axis (xz plane view) with proper rotation."""
-    D, H, W = volume_shape
-    device = gaussians.get_xyz.device
-    
-    xyz = gaussians.get_xyz  # (N, 3) in canonical (x, y, z) order
-    opacity = gaussians.get_opacity
-    scales = gaussians.get_scaling  # (N, 3) in (x, y, z) order
-    rotations = gaussians.get_rotation
-    
-    # World coordinates from canonical (x, y, z)
-    x_world = (xyz[:, 0] - 0.5) * W
-    z_world = (xyz[:, 2] - 0.5) * D
-    
-    px = (x_world / W + 0.5) * W
-    pz = (z_world / D + 0.5) * D
-    means2D = torch.stack([px, pz], dim=1)
-    
-    # Compute 3D covariance and project to xz plane
-    scales_world = scales * torch.tensor([W, H, D], device=device)  # (x, y, z) order
-    rot_matrices = quaternion_to_rotation_matrix(rotations)
-    S = torch.diag_embed(scales_world)
-    cov3d = rot_matrices @ S @ S @ rot_matrices.transpose(-1, -2)
-    
-    # Project to xz plane (indices 0 and 2 for x and z in canonical order)
-    cov2d = torch.stack([
-        torch.stack([cov3d[:, 0, 0], cov3d[:, 0, 2]], dim=1),  # [x,x], [x,z]
-        torch.stack([cov3d[:, 2, 0], cov3d[:, 2, 2]], dim=1)   # [z,x], [z,z]
-    ], dim=1)
-    
-    # Extract eigenvalues as sigmas
-    eigenvalues = torch.linalg.eigvalsh(cov2d)
-    sigma_x_px = torch.clamp(torch.sqrt(eigenvalues[:, 0] + 1e-6), min=0.5)
-    sigma_z_px = torch.clamp(torch.sqrt(eigenvalues[:, 1] + 1e-6), min=0.5)
-    sigmas = torch.stack([sigma_x_px, sigma_z_px], dim=1)
-    
-    intensities = opacity.squeeze(-1)
-    image = mip_render(means2D, sigmas, intensities, D, W)
-    
-    return image
-
-
-def render_mip_yz(gaussians, volume_shape):
-    """MIP rendering along x-axis (yz plane view) with proper rotation."""
-    D, H, W = volume_shape
-    device = gaussians.get_xyz.device
-    
-    xyz = gaussians.get_xyz  # (N, 3) in canonical (x, y, z) order
-    opacity = gaussians.get_opacity
-    scales = gaussians.get_scaling  # (N, 3) in (x, y, z) order
-    rotations = gaussians.get_rotation
-    
-    # World coordinates from canonical (x, y, z)
-    y_world = (xyz[:, 1] - 0.5) * H
-    z_world = (xyz[:, 2] - 0.5) * D
-    
-    py = (y_world / H + 0.5) * H
-    pz = (z_world / D + 0.5) * D
-    means2D = torch.stack([py, pz], dim=1)
-    
-    # Compute 3D covariance and project to yz plane
-    scales_world = scales * torch.tensor([W, H, D], device=device)  # (x, y, z) order
-    rot_matrices = quaternion_to_rotation_matrix(rotations)
-    S = torch.diag_embed(scales_world)
-    cov3d = rot_matrices @ S @ S @ rot_matrices.transpose(-1, -2)
-    
-    # Project to yz plane (indices 1 and 2 for y and z in canonical order)
-    cov2d = torch.stack([
-        torch.stack([cov3d[:, 1, 1], cov3d[:, 1, 2]], dim=1),  # [y,y], [y,z]
-        torch.stack([cov3d[:, 2, 1], cov3d[:, 2, 2]], dim=1)   # [z,y], [z,z]
-    ], dim=1)
-    
-    # Extract eigenvalues as sigmas
-    eigenvalues = torch.linalg.eigvalsh(cov2d)
-    sigma_y_px = torch.clamp(torch.sqrt(eigenvalues[:, 0] + 1e-6), min=0.5)
-    sigma_z_px = torch.clamp(torch.sqrt(eigenvalues[:, 1] + 1e-6), min=0.5)
-    sigmas = torch.stack([sigma_y_px, sigma_z_px], dim=1)
-    
-    intensities = opacity.squeeze(-1)
-    image = mip_render(means2D, sigmas, intensities, D, H)
-    
-    return image
-
 
 def render_slice_comparison(gaussians, target_volume, volume_shape, slice_positions, output_path, iteration, max_resolution=256):
     """
@@ -1501,14 +1356,16 @@ def train_volumetric_gaussians(
         # === Loss computation ===
         
         # 1. Tube-aware loss: sample along skeleton edges
-        skeleton_samples = skeleton_points[torch.randperm(len(skeleton_points), device=device)[:20000]]
+        # Note: 10k samples is sufficient - more samples use more memory
+        skeleton_samples = skeleton_points[torch.randperm(len(skeleton_points), device=device)[:10000]]
         rendered_skeleton = query_gaussians_chunked(gaussians, skeleton_samples, volume_shape, query_params=query_params)
         target_skeleton = trilinear_sample(target_volume, skeleton_samples)
         loss_skeleton = F.mse_loss(rendered_skeleton, target_skeleton)
         
         # 2. Stratified voxel loss with explicit foreground/background weighting
         # Use 30% foreground, 70% background to better learn to suppress background
-        fg_samples, bg_samples = sample_voxels_stratified(target_volume, num_samples=30000, 
+        # Note: 15k samples is sufficient - more samples use more memory
+        fg_samples, bg_samples = sample_voxels_stratified(target_volume, num_samples=15000, 
                                                           foreground_ratio=0.3, threshold=fg_threshold)
         
         # Foreground loss (reconstruct the neuron)
@@ -1578,6 +1435,10 @@ def train_volumetric_gaussians(
         
         # Backward
         loss_total.backward()
+        
+        # Clear GPU cache periodically to reduce memory fragmentation
+        if iteration % 50 == 0:
+            torch.cuda.empty_cache()
         
         # Track gradients for densification with EMA
         with torch.no_grad():
@@ -1657,15 +1518,6 @@ def train_volumetric_gaussians(
             
             # Save MIP visualizations
             with torch.no_grad():
-                mip_xy, _ = render_mip_simple(gaussians, volume_shape)
-                mip_xz = render_mip_xz(gaussians, volume_shape)
-                mip_yz = render_mip_yz(gaussians, volume_shape)
-                
-                for name, mip in [('xy', mip_xy), ('xz', mip_xz), ('yz', mip_yz)]:
-                    mip_np = mip.cpu().numpy()
-                    mip_np = (mip_np - mip_np.min()) / (mip_np.max() - mip_np.min() + 1e-8)
-                    mip_img = (mip_np * 255).astype(np.uint8)
-                    Image.fromarray(mip_img).save(os.path.join(output_path, f'mip_{name}_iter_{iteration+1}.png'))
                 
                 # Save slice comparisons (5 pairs)
                 slice_positions = [
