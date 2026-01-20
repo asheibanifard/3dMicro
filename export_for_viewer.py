@@ -63,7 +63,7 @@ def load_model(model_path, filter_outliers=True, max_scale_threshold=0.095):
     return xyz, opacity, scales, rotation, config
 
 
-def gaussians_to_volume(xyz, opacity, scales, volume_shape=(64, 256, 320)):
+def gaussians_to_volume(xyz, opacity, scales, volume_shape=(64, 256, 320), scale_multiplier=3.0, blend_mode='add'):
     """Rasterize Gaussians to a 3D volume grid.
     
     Args:
@@ -71,6 +71,8 @@ def gaussians_to_volume(xyz, opacity, scales, volume_shape=(64, 256, 320)):
         opacity: (N, 1) Gaussian opacities
         scales: (N, 3) Gaussian scales
         volume_shape: Output volume dimensions (z, y, x)
+        scale_multiplier: Multiplier for Gaussian scales (larger = more overlap/blending)
+        blend_mode: 'add' for additive blending, 'max' for MIP
         
     Returns:
         volume: 3D numpy array with rendered Gaussians
@@ -85,10 +87,11 @@ def gaussians_to_volume(xyz, opacity, scales, volume_shape=(64, 256, 320)):
     # Scale positions to volume coordinates
     positions = xyz_np * np.array([D-1, H-1, W-1])
     
-    # Scale factors in voxels
-    scale_voxels = scales_np * np.array([D, H, W])
+    # Scale factors in voxels - multiply by scale_multiplier for better overlap
+    scale_voxels = scales_np * np.array([D, H, W]) * scale_multiplier
     
     print(f"Rasterizing {len(xyz_np)} Gaussians to {volume_shape} volume...")
+    print(f"  Scale multiplier: {scale_multiplier}, Blend mode: {blend_mode}")
     
     # Efficient rasterization using bounding boxes
     for i in range(len(xyz_np)):
@@ -98,6 +101,9 @@ def gaussians_to_volume(xyz, opacity, scales, volume_shape=(64, 256, 320)):
         pos = positions[i]
         op = opacity_np[i]
         sc = scale_voxels[i]
+        
+        # Ensure minimum scale for visibility
+        sc = np.maximum(sc, 1.0)
         
         # Bounding box (3 sigma)
         radius = sc * 3
@@ -119,15 +125,18 @@ def gaussians_to_volume(xyz, opacity, scales, volume_shape=(64, 256, 320)):
         zz, yy, xx = np.meshgrid(zs, ys, xs, indexing='ij')
         
         # Compute Gaussian values
-        dz = (zz - pos[0]) / max(sc[0], 0.01)
-        dy = (yy - pos[1]) / max(sc[1], 0.01)
-        dx = (xx - pos[2]) / max(sc[2], 0.01)
+        dz = (zz - pos[0]) / max(sc[0], 0.5)
+        dy = (yy - pos[1]) / max(sc[1], 0.5)
+        dx = (xx - pos[2]) / max(sc[2], 0.5)
         
         gaussian = np.exp(-0.5 * (dz**2 + dy**2 + dx**2))
         
-        # Accumulate using MIP (max)
-        volume[z_min:z_max, y_min:y_max, x_min:x_max] = np.maximum(
-            volume[z_min:z_max, y_min:y_max, x_min:x_max],
+        # Accumulate based on blend mode
+        if blend_mode == 'add':
+            volume[z_min:z_max, y_min:y_max, x_min:x_max] += gaussian * op
+        else:  # max (MIP)
+            volume[z_min:z_max, y_min:y_max, x_min:x_max] = np.maximum(
+                volume[z_min:z_max, y_min:y_max, x_min:x_max],
             gaussian * op
         )
     
@@ -182,6 +191,10 @@ def main():
                         help='Volume resolution (z y x). Auto-detect from model if not specified.')
     parser.add_argument('--no-filter', action='store_true',
                         help='Disable outlier filtering')
+    parser.add_argument('--scale', '-s', type=float, default=5.0,
+                        help='Scale multiplier for Gaussians (default: 5.0, larger = smoother)')
+    parser.add_argument('--blend', '-b', choices=['add', 'max'], default='add',
+                        help='Blending mode: add (smoother) or max (sharper, default: add)')
     
     args = parser.parse_args()
     
@@ -204,7 +217,8 @@ def main():
     print(f"Output volume shape: {volume_shape}")
     
     # Rasterize to volume
-    volume = gaussians_to_volume(xyz, opacity, scales, volume_shape)
+    volume = gaussians_to_volume(xyz, opacity, scales, volume_shape, 
+                                  scale_multiplier=args.scale, blend_mode=args.blend)
     
     # Export for WebGL
     export_for_webgl(volume, args.output)

@@ -26,6 +26,14 @@ import numpy as np
 import tifffile as tiff
 import math
 
+# Try to import Open3D for visualization
+try:
+    import open3d as o3d
+    HAS_OPEN3D = True
+except ImportError:
+    HAS_OPEN3D = False
+    print("Warning: Open3D not available. Install with: pip install open3d")
+
 # The diff_gaussian_rasterization module must be pip installed from the submodules
 # Do NOT add the source folder to sys.path (causes circular import issues)
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
@@ -309,11 +317,133 @@ def create_camera(angle_deg, volume_shape, image_size=None, distance=None):
     tanfovx = math.tan(fovx * 0.5)
     tanfovy = math.tan(fovy * 0.5)
     
-    return world_view_transform, full_proj_transform, camera_center, tanfovx, tanfovy, img_h, img_w
+    return world_view_transform, full_proj_transform, camera_center, tanfovx, tanfovy, img_h, img_w, eye, forward, R
+
+
+def visualize_camera_and_gaussians(means3D, camera_eye, camera_forward, volume_shape, 
+                                     sample_ratio=0.1, show_frustum=True):
+    """
+    Visualize camera position and Gaussian locations using Open3D.
+    
+    Args:
+        means3D: (N, 3) Gaussian centers in world coordinates
+        camera_eye: (3,) Camera position
+        camera_forward: (3,) Camera forward direction
+        volume_shape: (D, H, W) volume dimensions
+        sample_ratio: Ratio of Gaussians to display (for performance)
+        show_frustum: Whether to show camera frustum lines
+    """
+    if not HAS_OPEN3D:
+        print("Open3D not available. Cannot visualize.")
+        return
+    
+    D, H, W = volume_shape
+    
+    # Convert to numpy
+    if torch.is_tensor(means3D):
+        points = means3D.cpu().numpy()
+    else:
+        points = means3D
+    
+    # Subsample for visualization
+    n_points = len(points)
+    n_sample = max(100, int(n_points * sample_ratio))
+    indices = np.random.choice(n_points, min(n_sample, n_points), replace=False)
+    points_sampled = points[indices]
+    
+    # Create point cloud for Gaussians
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points_sampled)
+    pcd.paint_uniform_color([0.0, 0.8, 0.2])  # Green for Gaussians
+    
+    # Create camera position as a red sphere
+    camera_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=max(D, H, W) * 0.02)
+    camera_sphere.translate(camera_eye)
+    camera_sphere.paint_uniform_color([1.0, 0.0, 0.0])  # Red for camera
+    
+    # Create camera direction arrow
+    arrow_length = max(D, H, W) * 0.3
+    arrow_end = camera_eye + camera_forward * arrow_length
+    
+    # Camera direction line
+    camera_line_points = [camera_eye, arrow_end]
+    camera_line = o3d.geometry.LineSet()
+    camera_line.points = o3d.utility.Vector3dVector(camera_line_points)
+    camera_line.lines = o3d.utility.Vector2iVector([[0, 1]])
+    camera_line.colors = o3d.utility.Vector3dVector([[1.0, 0.0, 0.0]])  # Red
+    
+    # Create bounding box showing volume extent
+    extent = max(D, H, W)
+    bbox_min = np.array([-W/2, -H/2, -D/2])
+    bbox_max = np.array([W/2, H/2, D/2])
+    bbox = o3d.geometry.AxisAlignedBoundingBox(min_bound=bbox_min, max_bound=bbox_max)
+    bbox.color = (0.5, 0.5, 0.5)  # Gray
+    
+    # Create coordinate frame at origin
+    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+        size=extent * 0.2, origin=[0, 0, 0]
+    )
+    
+    # Create frustum lines if requested
+    geometries = [pcd, camera_sphere, camera_line, bbox, coord_frame]
+    
+    if show_frustum:
+        # Simple frustum visualization (4 lines from camera to far corners)
+        fov = math.pi / 4  # 45 degrees half-angle
+        far_dist = extent * 2
+        far_half = far_dist * math.tan(fov)
+        
+        # Get camera right and up vectors
+        up = np.array([0, 1, 0])
+        right = np.cross(camera_forward, up)
+        if np.linalg.norm(right) < 1e-6:
+            up = np.array([0, 0, 1])
+            right = np.cross(camera_forward, up)
+        right = right / np.linalg.norm(right)
+        up = np.cross(right, camera_forward)
+        
+        # Far plane corners
+        far_center = camera_eye + camera_forward * far_dist
+        corners = [
+            far_center + right * far_half + up * far_half,
+            far_center - right * far_half + up * far_half,
+            far_center - right * far_half - up * far_half,
+            far_center + right * far_half - up * far_half,
+        ]
+        
+        frustum_points = [camera_eye] + corners
+        frustum_lines = [[0, 1], [0, 2], [0, 3], [0, 4], [1, 2], [2, 3], [3, 4], [4, 1]]
+        frustum = o3d.geometry.LineSet()
+        frustum.points = o3d.utility.Vector3dVector(frustum_points)
+        frustum.lines = o3d.utility.Vector2iVector(frustum_lines)
+        frustum.paint_uniform_color([1.0, 1.0, 0.0])  # Yellow
+        geometries.append(frustum)
+    
+    # Print debug info
+    print("\n=== Camera and Gaussian Visualization ===")
+    print(f"  Volume shape: {volume_shape} (D, H, W)")
+    print(f"  Volume world extent: x=[{-W/2:.1f}, {W/2:.1f}], y=[{-H/2:.1f}, {H/2:.1f}], z=[{-D/2:.1f}, {D/2:.1f}]")
+    print(f"  Camera position: {camera_eye}")
+    print(f"  Camera forward: {camera_forward}")
+    print(f"  Gaussian center: mean={points.mean(axis=0)}, std={points.std(axis=0)}")
+    print(f"  Gaussian bounds: min={points.min(axis=0)}, max={points.max(axis=0)}")
+    print(f"  Displaying {len(points_sampled)}/{n_points} Gaussians")
+    print("\nLegend:")
+    print("  RED sphere = Camera position")
+    print("  RED line = Camera viewing direction") 
+    print("  GREEN points = Gaussian centers")
+    print("  GRAY box = Volume bounding box")
+    print("  YELLOW lines = Camera frustum")
+    print("\nClose the Open3D window to continue...")
+    
+    # Show visualization
+    o3d.visualization.draw_geometries(geometries, 
+                                       window_name="Camera & Gaussians Debug View",
+                                       width=1280, height=720)
 
 
 def render_gaussians(xyz, opacity, scales, rotation, volume_shape, 
-                     angle=0, image_size=None, bg_color=None):
+                     angle=0, image_size=None, bg_color=None, visualize=False, scale_factor=6.0):
     """
     Render Gaussians using the official 3D Gaussian Splatting CUDA rasterizer.
     
@@ -340,6 +470,8 @@ def render_gaussians(xyz, opacity, scales, rotation, volume_shape,
         angle: Camera rotation angle in degrees
         image_size: (height, width) output image size
         bg_color: Background color (default black)
+        visualize: If True, show Open3D visualization of camera and Gaussians
+        scale_factor: Multiplier for Gaussian scales (higher=smoother/less noise)
     
     Returns:
         Rendered image (C, H, W)
@@ -386,12 +518,16 @@ def render_gaussians(xyz, opacity, scales, rotation, volume_shape,
     print(f"                 z=[{means3D[:,2].min().item():.1f}, {means3D[:,2].max().item():.1f}]")
     print(f"  Scales range: [{scales_world.min().item():.3f}, {scales_world.max().item():.3f}]")
     
-    # Create camera
+    # Create camera - now returns extra debug info
     (world_view_transform, full_proj_transform, camera_center, 
-     tanfovx, tanfovy, img_h, img_w) = create_camera(angle, volume_shape, image_size)
+     tanfovx, tanfovy, img_h, img_w, camera_eye, camera_forward, R) = create_camera(angle, volume_shape, image_size)
     
     print(f"  Image size: {img_h} x {img_w}")
     print(f"  Camera center: {camera_center.cpu().numpy()}")
+    
+    # Visualize camera and Gaussians if requested
+    if visualize and HAS_OPEN3D:
+        visualize_camera_and_gaussians(means3D, camera_eye, camera_forward, volume_shape)
     
     # Background color: the canvas behind all Gaussians
     # Black (default) for dark-field rendering, white for visibility testing
@@ -410,6 +546,15 @@ def render_gaussians(xyz, opacity, scales, rotation, volume_shape,
     # Set requires_grad=False since we're doing inference only
     means2D = torch.zeros_like(means3D, requires_grad=False)
     
+    # Increase scales to make Gaussians more visible and reduce noise
+    # The original scales are often too small for smooth visualization
+    # Higher values = smoother but less detailed, lower = sharper but noisier
+    scale_boost = scale_factor  # Use parameter instead of hardcoded value
+    scale_modifier = 1.0  # Keep rasterizer modifier at 1.0, apply all scaling to values
+    scales_boosted = scales_world * scale_boost
+    print(f"  Scale factor: {scale_boost}x")
+    print(f"  Boosted scales range: [{scales_boosted.min().item():.3f}, {scales_boosted.max().item():.3f}]")
+    
     # Rasterization settings: configures the CUDA rendering kernel
     # These settings control how Gaussians are projected, culled, and blended
     raster_settings = GaussianRasterizationSettings(
@@ -418,7 +563,7 @@ def render_gaussians(xyz, opacity, scales, rotation, volume_shape,
         tanfovx=tanfovx,  # tan(fov_x / 2) for screen-space projection
         tanfovy=tanfovy,  # tan(fov_y / 2) for screen-space projection
         bg=bg_color,  # Background color (RGB)
-        scale_modifier=1.0,  # Multiplier for all Gaussian scales (1.0 = no change)
+        scale_modifier=scale_modifier,  # Multiplier for all Gaussian scales
         viewmatrix=world_view_transform,  # 4x4 world-to-camera transformation
         projmatrix=full_proj_transform,  # 4x4 combined view-projection matrix
         sh_degree=0,  # Spherical harmonics degree (0 = use precomputed colors)
@@ -444,7 +589,7 @@ def render_gaussians(xyz, opacity, scales, rotation, volume_shape,
             opacities=opacity,  # Gaussian opacities (N, 1)
             shs=None,  # Spherical harmonics (not used, using colors_precomp)
             colors_precomp=colors_precomp,  # Precomputed RGB colors (N, 3)
-            scales=scales_world,  # Gaussian scales in world space (N, 3)
+            scales=scales_boosted,  # Gaussian scales in world space (N, 3) - BOOSTED
             rotations=rotations,  # Rotation quaternions (N, 4)
             cov3D_precomp=None  # Precomputed 3D covariance (None = compute from scales/rotations)
         )
@@ -728,6 +873,9 @@ def main():
         
         # Render multiple views
         python render_real_splatting.py --multiview --mode alpha
+        
+        # Debug camera with Open3D visualization
+        python render_real_splatting.py --angle 30 --visualize
     """
     import argparse
     
@@ -751,6 +899,12 @@ Examples:
   
   # MIP rendering with custom image size
   python render_real_splatting.py --mode mip --image_size 512 512
+  
+  # Debug camera position with Open3D
+  python render_real_splatting.py --angle 30 --visualize
+  
+  # Smoother rendering with higher scale (reduces noise)
+  python render_real_splatting.py --scale 10 --mode alpha
 """)
     parser.add_argument('--model_path', type=str, default='final_model.pth',
                         help='Path to trained model')
@@ -770,6 +924,10 @@ Examples:
                         help='Output image size (height width)')
     parser.add_argument('--mode', type=str, default='alpha', choices=['alpha', 'mip'],
                         help='Rendering mode: alpha (3DGS blending) or mip (Maximum Intensity Projection)')
+    parser.add_argument('--visualize', action='store_true',
+                        help='Show Open3D visualization of camera and Gaussians for debugging')
+    parser.add_argument('--scale', type=float, default=6.0,
+                        help='Scale multiplier for Gaussians (higher=smoother, lower=sharper/noisier, default=6.0)')
     
     args = parser.parse_args()
     
@@ -821,7 +979,8 @@ Examples:
         else:
             # Alpha blending: returns (3, H, W) RGB, extract first channel
             image = render_gaussians(xyz, opacity, scales, rotation, volume_shape,
-                                     angle=args.angle, image_size=image_size)
+                                     angle=args.angle, image_size=image_size,
+                                     visualize=args.visualize, scale_factor=args.scale)
             img_np = image[0].cpu().numpy()  # Grayscale channel
         
         # Save as 16-bit TIFF (preserves dynamic range better than 8-bit)
